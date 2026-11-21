@@ -368,6 +368,10 @@ class TadoDataUpdateCoordinator(OffsetCalSchedulerMixin, DataUpdateCoordinator[A
         self._offset_cal_send_ready_at: dict[int, datetime] = {}
         # serial -> (inside temperature used, offset written)
         self._offset_cal_inside_anchor: dict[str, tuple[float, float]] = {}
+        # Tado X: raw reading per device from the last roomsAndDevices fetch.
+        self._offset_cal_device_readings: dict[str, float] = {}
+        self._offset_cal_device_readings_at: float | None = None
+        self._offset_cal_fetch_baseline: dict[int, tuple[float, float | None]] = {}
         self._offset_cal_window_settle_until: dict[int, datetime] = {}
         self._offset_cal_window_was_open: set[int] = set()
         self._offset_cal_interval_pending: set[int] = set()

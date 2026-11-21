@@ -219,6 +219,8 @@ class TadoXDevice(BaseModel):
     child_lock_enabled: bool | None = Field(None, alias="childLockEnabled")
     characteristics: HopsCharacteristics = Field(default_factory=HopsCharacteristics)
     temperature_offset: float | None = Field(None, alias="temperatureOffset")
+    # This device's own sensor, before the offset. The room reading is one device.
+    temperature_as_measured: float | None = Field(None, alias="temperatureAsMeasured")
 
     @model_validator(mode="after")
     def _infer_capabilities(self) -> TadoXDevice:
