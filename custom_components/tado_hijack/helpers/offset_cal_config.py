@@ -356,6 +356,15 @@ class OffsetCalSchedulerMixin(OffsetCalConfigMixin):
             if isinstance(linked, dict) and (entity_id := linked.get(str(zone_id))):
                 entity_ids.append(str(entity_id))
         entity_ids.extend(self._window_contact_ids(list(zones)))
+        # Tado X: a device's own reading moving is a reason to look again.
+        from .offset_calibrate import device_climate_ids
+
+        for zone_id in zones:
+            if isinstance(linked, dict) and linked.get(str(zone_id)):
+                entity_ids.extend(
+                    device_climate_ids(cast("Any", self), zone_id).values()
+                )
+        entity_ids = list(dict.fromkeys(entity_ids))
         if not entity_ids:
             return
         self._offset_cal_threshold_unsubs.append(

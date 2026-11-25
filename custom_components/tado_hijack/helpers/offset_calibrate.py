@@ -83,11 +83,12 @@ def daily_offset_cal_puts(coordinator: TadoDataUpdateCoordinator) -> int:
     )
     total = 0
     zone_options: dict[int, str] = {}
-    for _serial, zone_id in measuring_devices(coordinator):
+    for serial, zone_id in measuring_devices(coordinator):
         if not linked.get(str(zone_id)):
             continue
         option = str(resolver(zone_id) if resolver is not None else fallback)
-        zone_options[zone_id] = option
+        if serial not in device_climate_ids(coordinator, zone_id):
+            zone_options[zone_id] = option
         total += _puts_for_cal_option(option)
     return total + _daily_device_reading_gets(coordinator, zone_options)
 
@@ -97,6 +98,7 @@ def _daily_device_reading_gets(
 ) -> int:
     """roomsAndDevices GETs per day for per-device readings (Tado X only).
 
+    zone_options holds only rooms with a device that has no local climate.
     Rooms on the same clock slot share one GET. on_reset is one for the home.
     threshold is the same one-per-room guess as its write.
     """
@@ -289,18 +291,53 @@ def _per_device_candidates(
     linked: dict[str, Any],
     requested_zone: int | None,
 ) -> dict[int, str]:
-    """Tado X zones in this request, with their linked reference entity."""
+    """Tado X zones that need a cloud reading, with their reference entity.
+
+    A device with a local reading is read there. Only a zone that has a
+    device without one is worth a GET.
+    """
     from ..const import GEN_X
 
     if coordinator.generation != GEN_X:
         return {}
     zones: dict[int, str] = {}
-    for _serial, zid in measuring_devices(coordinator):
-        if zid in zones:
+    for serial, zid in measuring_devices(coordinator):
+        if zid in zones or serial in _device_local_temps(coordinator, zid):
             continue
         if entity_id := _linked_entity_id(coordinator, requested_zone, zid, linked):
             zones[zid] = entity_id
     return zones
+
+
+def device_climate_ids(
+    coordinator: TadoDataUpdateCoordinator, zone_id: int
+) -> dict[str, str]:
+    """Serial to its local Matter climate, for Tado X devices in this zone."""
+    from ..const import GEN_X
+    from .zone_utils import trv_serials
+
+    if getattr(coordinator, "generation", None) != GEN_X:
+        return {}
+    tracker = getattr(coordinator, "availability_tracker", None)
+    if tracker is None:
+        return {}
+    return {
+        serial: entity_id
+        for serial in trv_serials(coordinator.zones_meta, zone_id)
+        if (entity_id := tracker.get_entity_id(serial))
+    }
+
+
+def _device_local_temps(
+    coordinator: TadoDataUpdateCoordinator, zone_id: int
+) -> dict[str, float]:
+    """Live reading per device from its local climate. Free, no cloud call."""
+    temps: dict[str, float] = {}
+    for serial, entity_id in device_climate_ids(coordinator, zone_id).items():
+        value = read_entity_temperature(coordinator.hass, entity_id)
+        if value is not None:
+            temps[serial] = value
+    return temps
 
 
 def _threshold_fetch_due(
@@ -308,8 +345,10 @@ def _threshold_fetch_due(
 ) -> bool:
     """True when the room moved enough since the last fetch to justify a GET.
 
-    The gap between the reference and the room reading stands in for every
-    device in the room. Half the spread, so a device near its limit is seen.
+    The gap is the reference against each device's local climate, and against
+    the room reading. Only the movement since the last fetch counts, so it does
+    not matter whether the local reading carries the offset. Half the spread,
+    so a device near its limit is seen.
     """
     reference = read_entity_temperature(coordinator.hass, entity_id)
     if reference is None:
@@ -317,13 +356,18 @@ def _threshold_fetch_due(
     baseline = coordinator._offset_cal_fetch_baseline.get(zone_id)
     if baseline is None:
         return True
-    reference_then, inside_then = baseline
-    moved = reference - reference_then
+    reference_then, inside_then, locals_then = baseline
+    reference_moved = reference - reference_then
+    moves: list[float] = []
     inside = _zone_inside(coordinator, zone_id)
     if inside is not None and inside_then is not None:
-        moved -= inside - inside_then
+        moves.append(reference_moved - (inside - inside_then))
+    for serial, value in _device_local_temps(coordinator, zone_id).items():
+        if (then := locals_then.get(serial)) is not None:
+            moves.append(reference_moved - (value - then))
     limit = max(coordinator.get_zone_offset_cal_threshold(zone_id) / 2, OFFSET_STEP)
-    return abs(moved) >= limit
+    # Nothing to compare against: the reference alone decides.
+    return any(abs(move) >= limit for move in moves or [reference_moved])
 
 
 async def _fetch_device_readings(
@@ -371,10 +415,10 @@ async def _device_readings_for_run(
     linked: dict[str, Any],
     requested_zone: int | None,
 ) -> dict[str, float] | None:
-    """Per-device readings for this run. None keeps the room-reading path.
+    """Cloud readings for devices with no local climate. None means no GET.
 
-    An empty dict means a threshold run with no room that moved: no GET and
-    no write.
+    An empty dict means a threshold run with no room that moved: no GET, and
+    those devices are left alone.
     """
     zones = _per_device_candidates(coordinator, linked, requested_zone)
     if not zones:
@@ -396,6 +440,7 @@ async def _device_readings_for_run(
             coordinator._offset_cal_fetch_baseline[zid] = (
                 reference,
                 _zone_inside(coordinator, zid),
+                _device_local_temps(coordinator, zid),
             )
     return readings
 
@@ -408,20 +453,30 @@ async def queue_offset_cal_writes(
 ) -> int:
     """Queue one offset write per measuring device that needs a change.
 
-    Tado X compares each device's own raw reading. Classic, and a Tado X
-    device with no such reading, use the room reading.
+    A Tado X device is compared with its own sensor: its local Matter climate,
+    or the cloud's raw reading when it has no such climate. Classic, and a
+    Tado X device with neither, use the room reading.
     """
     wrote = 0
     zone_states = getattr(coordinator.data, "zone_states", None) or {}
     readings = await _device_readings_for_run(coordinator, reason, linked, zone_id)
-    if readings is not None and not readings:
-        return 0
+    local_temps: dict[int, dict[str, float]] = {}
     for serial, zid in measuring_devices(coordinator):
+        if zid not in local_temps:
+            local_temps[zid] = _device_local_temps(coordinator, zid)
+        local = local_temps[zid].get(serial)
         measured = readings.get(serial) if readings else None
-        if measured is not None:
+        if local is not None:
+            queued = await _queue_local_offset(
+                coordinator, reason, linked, zone_id, serial, zid, local
+            )
+        elif measured is not None:
             queued = await _queue_measured_offset(
                 coordinator, reason, linked, zone_id, serial, zid, measured
             )
+        elif readings is not None and not readings:
+            # Threshold run, and the room has not moved since the last fetch.
+            queued = False
         else:
             queued = await _queue_one_offset(
                 coordinator, reason, linked, zone_id, serial, zid, zone_states
@@ -429,6 +484,87 @@ async def queue_offset_cal_writes(
         if queued:
             wrote += 1
     return wrote
+
+
+# A written offset reaches the device a little later. Until its local reading
+# has moved by half the change, the old reading would add the change again.
+_LOCAL_SETTLE_MAX_S = 900.0
+
+
+def local_write_is_pending(
+    hold: tuple[float, float, float, float] | None,
+    *,
+    local: float,
+    current: float,
+    now: float,
+) -> bool:
+    """True while the last write is not yet visible in the local reading.
+
+    hold is (reading before the write, old offset, new offset, time written).
+    A different offset now means someone else set it, so the hold is over.
+    """
+    if hold is None:
+        return False
+    local_then, old_offset, new_offset, written_at = hold
+    if abs(current - new_offset) >= OFFSET_STEP:
+        return False
+    if now - written_at >= _LOCAL_SETTLE_MAX_S:
+        return False
+    change = new_offset - old_offset
+    moved = (local - local_then) * (1 if change > 0 else -1)
+    return moved < abs(change) / 2
+
+
+async def _queue_local_offset(
+    coordinator: TadoDataUpdateCoordinator,
+    reason: str,
+    linked: dict[str, Any],
+    requested_zone: int | None,
+    serial: str,
+    zone_id: int,
+    local: float,
+) -> bool:
+    """Queue one write from this device's local climate reading (Tado X).
+
+    That reading includes the offset, the same as the room reading does.
+    """
+    import time
+
+    entity_id = _linked_entity_id(coordinator, requested_zone, zone_id, linked)
+    if entity_id is None:
+        return False
+    thermostat = read_entity_temperature(coordinator.hass, entity_id)
+    current = await _current_offset(coordinator, serial, zone_id)
+    if thermostat is None or current is None:
+        _log_missing_offset(reason, zone_id, serial, thermostat, local, current)
+        return False
+    now = time.monotonic()
+    holds = coordinator._offset_cal_local_hold
+    if local_write_is_pending(holds.get(serial), local=local, current=current, now=now):
+        if reason == "manual":
+            _LOGGER.info(
+                "Offset cal (manual) %s: the last write is not on the device yet",
+                serial,
+            )
+        return False
+    holds.pop(serial, None)
+    desired = compute_device_offset(thermostat, local, current)
+    threshold = coordinator.get_zone_offset_cal_threshold(zone_id)
+    if abs(desired - current) < max(threshold, OFFSET_STEP):
+        return False
+    _LOGGER.info(
+        "Offset cal (%s) %s: thermostat=%.2f device=%.2f offset %.1f -> %.1f",
+        reason,
+        serial,
+        thermostat,
+        local,
+        current,
+        desired,
+    )
+    await coordinator.async_set_temperature_offset(serial, desired)
+    holds[serial] = (local, current, desired, now)
+    coordinator._offset_cal_inside_anchor.pop(serial, None)
+    return True
 
 
 async def _queue_measured_offset(

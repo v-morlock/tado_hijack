@@ -368,10 +368,14 @@ class TadoDataUpdateCoordinator(OffsetCalSchedulerMixin, DataUpdateCoordinator[A
         self._offset_cal_send_ready_at: dict[int, datetime] = {}
         # serial -> (inside temperature used, offset written)
         self._offset_cal_inside_anchor: dict[str, tuple[float, float]] = {}
-        # Tado X: raw reading per device from the last roomsAndDevices fetch.
+        # Tado X, device with no local climate: raw reading from roomsAndDevices.
+        # Tado X: (local reading, old offset, new offset, time) of the last write.
+        self._offset_cal_local_hold: dict[str, tuple[float, float, float, float]] = {}
         self._offset_cal_device_readings: dict[str, float] = {}
         self._offset_cal_device_readings_at: float | None = None
-        self._offset_cal_fetch_baseline: dict[int, tuple[float, float | None]] = {}
+        self._offset_cal_fetch_baseline: dict[
+            int, tuple[float, float | None, dict[str, float]]
+        ] = {}
         self._offset_cal_window_settle_until: dict[int, datetime] = {}
         self._offset_cal_window_was_open: set[int] = set()
         self._offset_cal_interval_pending: set[int] = set()
@@ -1135,6 +1139,8 @@ class TadoDataUpdateCoordinator(OffsetCalSchedulerMixin, DataUpdateCoordinator[A
 
     async def _async_start_recovery_stack(self) -> None:
         """Start availability tracking and the local recovery listener."""
+        # Device climates join the threshold watch once they are mapped.
+        self.availability_tracker.register_on_map(self.note_offset_sources_changed)
         await self.availability_tracker.async_start()
         await self.local_proxy.async_start()
         await self.recovery_listener.async_start()
