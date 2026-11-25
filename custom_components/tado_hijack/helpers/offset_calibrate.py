@@ -173,6 +173,16 @@ def compute_device_offset(
     return round(stepped, 1)
 
 
+def offset_change_reaches(desired: float, current: float, threshold: float) -> bool:
+    """True when the change is at least the threshold, and at least one step.
+
+    Compared in tenths: -8.4 against -8.3 is 0.0999... as floats, and a
+    threshold of 0.1 would never be reached by a single step.
+    """
+    change = round(abs(desired - current), 1)
+    return change >= round(max(threshold, OFFSET_STEP), 1)
+
+
 def inside_from_zone_state(state: Any) -> float | None:
     """Tado's own zone measurement (not a linked HA thermostat)."""
     if not state:
@@ -580,7 +590,7 @@ async def _queue_local_offset(
     holds.pop(serial, None)
     desired = compute_device_offset(thermostat, local, current)
     threshold = coordinator.get_zone_offset_cal_threshold(zone_id)
-    if abs(desired - current) < max(threshold, OFFSET_STEP):
+    if not offset_change_reaches(desired, current, threshold):
         return False
     _LOGGER.info(
         "Offset cal (%s) %s: thermostat=%.2f device=%.2f offset %.1f -> %.1f",
@@ -617,7 +627,7 @@ async def _queue_measured_offset(
         return False
     desired = compute_measured_offset(thermostat, measured)
     threshold = coordinator.get_zone_offset_cal_threshold(zone_id)
-    if abs(desired - current) < max(threshold, OFFSET_STEP):
+    if not offset_change_reaches(desired, current, threshold):
         return False
     _LOGGER.info(
         "Offset cal (%s) %s: thermostat=%.2f device raw=%.2f offset %.1f -> %.1f",
@@ -719,7 +729,7 @@ async def _queue_one_offset(
         return False
     desired = compute_device_offset(thermostat, tado_inside, current)
     threshold = coordinator.get_zone_offset_cal_threshold(zone_id)
-    if abs(desired - current) < max(threshold, OFFSET_STEP):
+    if not offset_change_reaches(desired, current, threshold):
         return False
     _LOGGER.info(
         "Offset cal (%s) %s: thermostat=%.2f tado=%.2f offset %.1f -> %.1f",
