@@ -512,6 +512,7 @@
           "24h": "Once a day (00:00)",
           "on_reset": "Once per quota reset",
           "threshold": "When deviation reaches the threshold",
+          "1m": "Every minute (cloud reading, many calls)",
           "inherit": "Default (Bridge)"
         }
       }

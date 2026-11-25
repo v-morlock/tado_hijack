@@ -512,6 +512,7 @@
           "24h": "1x am Tag (00:00)",
           "on_reset": "Einmal nach Kontingent-Rücksetzung",
           "threshold": "Sobald die Abweichung den Schwellwert erreicht",
+          "1m": "Jede Minute (Cloud-Messwert, viele Aufrufe)",
           "inherit": "Standard (Bridge)"
         }
       }

@@ -360,6 +360,7 @@ class TadoDataUpdateCoordinator(OffsetCalSchedulerMixin, DataUpdateCoordinator[A
         self.api_manager = TadoApiManager(hass, self, self._debounce_time)
         self._zone_plan_locks: dict[int, asyncio.Lock] = {}
         self._offset_cal_unsub: Callable[[], None] | None = None
+        self._offset_cal_minute_unsub: Callable[[], None] | None = None
         self._plan_edge_unsub: Callable[[], None] | None = None
         self._plan_edge_stopped = False
         self._offset_cal_threshold_unsubs: list[Callable[[], None]] = []
@@ -1115,6 +1116,9 @@ class TadoDataUpdateCoordinator(OffsetCalSchedulerMixin, DataUpdateCoordinator[A
         if self._offset_cal_unsub:
             self._offset_cal_unsub()
             self._offset_cal_unsub = None
+        if self._offset_cal_minute_unsub:
+            self._offset_cal_minute_unsub()
+            self._offset_cal_minute_unsub = None
         for unsub in self._offset_cal_threshold_unsubs:
             unsub()
         self._offset_cal_threshold_unsubs = []
@@ -2011,7 +2015,7 @@ class TadoDataUpdateCoordinator(OffsetCalSchedulerMixin, DataUpdateCoordinator[A
             ):
                 return 0
             wrote = await self._queue_offset_cal_writes(reason, linked, zone_id)
-            if reason not in {"manual", "threshold"}:
+            if reason not in {"manual", "threshold", "minute"}:
                 self._last_offset_cal_at = dt_util.now()
             if wrote:
                 _LOGGER.info("Offset auto-cal (%s) queued %d device(s)", reason, wrote)

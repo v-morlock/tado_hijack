@@ -58,6 +58,7 @@ class OffsetCalConfigMixin:
         _offset_cal_interval_retry: Callable[[], None] | None
         _offset_cal_interval_flushing: bool
         _offset_cal_interval_flush_again: bool
+        _offset_cal_minute_unsub: Callable[[], None] | None
 
         def async_calibrate_offsets(
             self, trigger: str, zone_id: int | None = None
@@ -137,6 +138,7 @@ class OffsetCalSchedulerMixin(OffsetCalConfigMixin):
         if self._offset_cal_unsub:
             self._offset_cal_unsub()
             self._offset_cal_unsub = None
+        self._schedule_offset_cal_minute()
         hours = sorted(self._all_offset_cal_hours())
         self._drop_stale_interval_holds()
         if not hours:
@@ -151,6 +153,39 @@ class OffsetCalSchedulerMixin(OffsetCalConfigMixin):
         )
         _LOGGER.info("Offset auto-cal scheduled at local hours %s", hours)
         self._schedule_offset_cal_threshold_watch()
+
+    def _zones_on_minute(self) -> list[int]:
+        from .offset_calibrate import OFFSET_CAL_MINUTE
+
+        return [
+            zone_id
+            for zone_id in self._linked_zone_ids()
+            if self.effective_zone_offset_cal_interval(zone_id) == OFFSET_CAL_MINUTE
+        ]
+
+    def _schedule_offset_cal_minute(self) -> None:
+        from homeassistant.helpers.event import async_track_time_interval
+
+        if self._offset_cal_minute_unsub:
+            self._offset_cal_minute_unsub()
+            self._offset_cal_minute_unsub = None
+        if not self._zones_on_minute():
+            return
+        self._offset_cal_minute_unsub = async_track_time_interval(
+            self.hass, self._on_offset_cal_minute, timedelta(minutes=1)
+        )
+        _LOGGER.info("Offset auto-cal runs every minute from the cloud reading")
+
+    async def _on_offset_cal_minute(self, _now: datetime) -> None:
+        """One GET for the home, shared by every room on this mode."""
+        from .offset_calibrate import OFFSET_CAL_MINUTE_REASON
+
+        for zone_id in self._zones_on_minute():
+            if self._offset_cal_window_open(zone_id):
+                continue
+            await self.async_calibrate_offsets(
+                OFFSET_CAL_MINUTE_REASON, zone_id=zone_id
+            )
 
     async def _on_offset_cal_tick(self, now: datetime) -> None:
         held = False

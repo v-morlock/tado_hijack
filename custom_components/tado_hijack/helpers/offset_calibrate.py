@@ -26,6 +26,10 @@ OFFSET_CAL_OFF = "off"
 OFFSET_CAL_ON_RESET = "on_reset"
 OFFSET_CAL_THRESHOLD = "threshold"
 OFFSET_CAL_INHERIT = "inherit"
+# Tado X experiment: one roomsAndDevices GET a minute for the home, then one
+# write per device from the cloud's raw reading. No local reading, no hold.
+OFFSET_CAL_MINUTE = "1m"
+OFFSET_CAL_MINUTE_REASON = "minute"
 OFFSET_CAL_HOUR_STEPS: tuple[int, ...] = (3, 6, 9, 12, 15, 18, 21, 24)
 OFFSET_CAL_INTERVALS: tuple[str, ...] = tuple(
     f"{hours}h" for hours in OFFSET_CAL_HOUR_STEPS
@@ -35,6 +39,7 @@ OFFSET_CAL_OPTIONS: tuple[str, ...] = (
     *OFFSET_CAL_INTERVALS,
     OFFSET_CAL_ON_RESET,
     OFFSET_CAL_THRESHOLD,
+    OFFSET_CAL_MINUTE,
 )
 
 
@@ -267,7 +272,7 @@ def measuring_devices(
 
 # Tado X only. One roomsAndDevices GET serves every room, so a run that
 # follows another inside this window reuses the readings.
-_DEVICE_READINGS_REUSE_S = {"manual": 30.0, "threshold": 300.0}
+_DEVICE_READINGS_REUSE_S = {"manual": 30.0, "threshold": 300.0, "minute": 30.0}
 _DEVICE_READINGS_REUSE_DEFAULT_S = 60.0
 
 
@@ -290,6 +295,7 @@ def _per_device_candidates(
     coordinator: TadoDataUpdateCoordinator,
     linked: dict[str, Any],
     requested_zone: int | None,
+    cloud_only: bool = False,
 ) -> dict[int, str]:
     """Tado X zones that need a cloud reading, with their reference entity.
 
@@ -302,7 +308,9 @@ def _per_device_candidates(
         return {}
     zones: dict[int, str] = {}
     for serial, zid in measuring_devices(coordinator):
-        if zid in zones or serial in _device_local_temps(coordinator, zid):
+        if zid in zones:
+            continue
+        if not cloud_only and serial in _device_local_temps(coordinator, zid):
             continue
         if entity_id := _linked_entity_id(coordinator, requested_zone, zid, linked):
             zones[zid] = entity_id
@@ -420,7 +428,9 @@ async def _device_readings_for_run(
     An empty dict means a threshold run with no room that moved: no GET, and
     those devices are left alone.
     """
-    zones = _per_device_candidates(coordinator, linked, requested_zone)
+    zones = _per_device_candidates(
+        coordinator, linked, requested_zone, reason == OFFSET_CAL_MINUTE_REASON
+    )
     if not zones:
         return None
     if reason == "threshold":
@@ -461,7 +471,16 @@ async def queue_offset_cal_writes(
     zone_states = getattr(coordinator.data, "zone_states", None) or {}
     readings = await _device_readings_for_run(coordinator, reason, linked, zone_id)
     local_temps: dict[int, dict[str, float]] = {}
+    cloud_only = reason == OFFSET_CAL_MINUTE_REASON
     for serial, zid in measuring_devices(coordinator):
+        if cloud_only:
+            # Cloud reading or nothing. No fallback that could disagree with it.
+            measured = readings.get(serial) if readings else None
+            if measured is not None and await _queue_measured_offset(
+                coordinator, reason, linked, zone_id, serial, zid, measured
+            ):
+                wrote += 1
+            continue
         if zid not in local_temps:
             local_temps[zid] = _device_local_temps(coordinator, zid)
         local = local_temps[zid].get(serial)
