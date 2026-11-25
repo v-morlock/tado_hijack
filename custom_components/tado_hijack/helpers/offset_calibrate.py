@@ -158,6 +158,22 @@ def offset_reading_is_anchored(
     )
 
 
+def step_toward(exact: float, current: float) -> float:
+    """Exact offset cut down to whole steps, counted from the current one.
+
+    Rounding to the nearest step moves the offset as soon as the exact value
+    is half a step away, so a reading that wobbles by half a step flips it
+    back and forth. Counting whole steps from the current offset means a move
+    needs a full step of difference, and so does the move back.
+    """
+    clamped = max(OFFSET_MIN, min(OFFSET_MAX, exact))
+    steps = (clamped - current) / OFFSET_STEP
+    # -8.4 against -8.3 is 0.999... steps as floats.
+    whole = int(steps + (1e-6 if steps > 0 else -1e-6))
+    stepped = round(current + whole * OFFSET_STEP, 1)
+    return max(OFFSET_MIN, min(OFFSET_MAX, stepped))
+
+
 def compute_device_offset(
     thermostat: float, tado_inside: float, current_offset: float
 ) -> float:
@@ -167,10 +183,7 @@ def compute_device_offset(
     inside - current, and the new offset is thermostat - raw.
     """
     raw = tado_inside - current_offset
-    desired = thermostat - raw
-    clamped = max(OFFSET_MIN, min(OFFSET_MAX, desired))
-    stepped = round(clamped / OFFSET_STEP) * OFFSET_STEP
-    return round(stepped, 1)
+    return step_toward(thermostat - raw, current_offset)
 
 
 def offset_change_reaches(desired: float, current: float, threshold: float) -> bool:
@@ -286,12 +299,14 @@ _DEVICE_READINGS_REUSE_S = {"manual": 30.0, "threshold": 300.0, "minute": 30.0}
 _DEVICE_READINGS_REUSE_DEFAULT_S = 60.0
 
 
-def compute_measured_offset(thermostat: float, measured: float) -> float:
+def compute_measured_offset(
+    thermostat: float, measured: float, current_offset: float
+) -> float:
     """Offset from a device's own raw reading (Tado X temperatureAsMeasured).
 
     That reading does not include the offset, so nothing is subtracted.
     """
-    return compute_device_offset(thermostat, measured, 0.0)
+    return step_toward(thermostat - measured, current_offset)
 
 
 def _zone_inside(coordinator: TadoDataUpdateCoordinator, zone_id: int) -> float | None:
@@ -625,7 +640,7 @@ async def _queue_measured_offset(
     if thermostat is None or current is None:
         _log_missing_offset(reason, zone_id, serial, thermostat, measured, current)
         return False
-    desired = compute_measured_offset(thermostat, measured)
+    desired = compute_measured_offset(thermostat, measured, current)
     threshold = coordinator.get_zone_offset_cal_threshold(zone_id)
     if not offset_change_reaches(desired, current, threshold):
         return False
