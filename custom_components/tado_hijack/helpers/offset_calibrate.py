@@ -486,9 +486,13 @@ async def queue_offset_cal_writes(
     return wrote
 
 
-# A written offset reaches the device a little later. Until its local reading
-# has moved by half the change, the old reading would add the change again.
+# A written offset reaches the device a little later, and shows there as one
+# jump of that size. Until the jump is seen, the old reading would add the
+# change again. A small change cannot be told from drift, and a second pass
+# costs at most that small change, so it waits only briefly.
 _LOCAL_SETTLE_MAX_S = 900.0
+_LOCAL_SETTLE_SMALL_S = 120.0
+_LOCAL_SETTLE_SMALL_CHANGE = 0.5
 
 
 def local_write_is_pending(
@@ -500,19 +504,23 @@ def local_write_is_pending(
 ) -> bool:
     """True while the last write is not yet visible in the local reading.
 
-    hold is (reading before the write, old offset, new offset, time written).
-    A different offset now means someone else set it, so the hold is over.
+    hold is (reading at the last look, old offset, new offset, time written).
+    The jump is measured from the last look, so drift the other way before
+    the device applies the offset does not hide it. A different offset now
+    means someone else set it, so the hold is over.
     """
     if hold is None:
         return False
     local_then, old_offset, new_offset, written_at = hold
     if abs(current - new_offset) >= OFFSET_STEP:
         return False
-    if now - written_at >= _LOCAL_SETTLE_MAX_S:
-        return False
     change = new_offset - old_offset
-    moved = (local - local_then) * (1 if change > 0 else -1)
-    return moved < abs(change) / 2
+    small = abs(change) < _LOCAL_SETTLE_SMALL_CHANGE
+    limit = _LOCAL_SETTLE_SMALL_S if small else _LOCAL_SETTLE_MAX_S
+    if now - written_at >= limit:
+        return False
+    jumped = (local - local_then) * (1 if change > 0 else -1)
+    return jumped < abs(change) / 2 - 1e-6
 
 
 async def _queue_local_offset(
@@ -540,7 +548,10 @@ async def _queue_local_offset(
         return False
     now = time.monotonic()
     holds = coordinator._offset_cal_local_hold
-    if local_write_is_pending(holds.get(serial), local=local, current=current, now=now):
+    hold = holds.get(serial)
+    if local_write_is_pending(hold, local=local, current=current, now=now):
+        if hold is not None:
+            holds[serial] = (local, hold[1], hold[2], hold[3])
         if reason == "manual":
             _LOGGER.info(
                 "Offset cal (manual) %s: the last write is not on the device yet",
